@@ -1,35 +1,31 @@
-#include <stdlib.h>
+#define _XOPEN_SOURCE 700
+#include <ucontext.h>
 #include <stdio.h>
-#include <setjmp.h>
+
 #include "co.h"
 
 /******************************************************************************
  *****************************************************************************/
-typedef struct coroutine_s {
-  size_t id;
+typedef size_t coid;
 
+typedef struct cor_s {
+  coid id;
   void (*f)(void *);
   void *arg;
+  ucontext_t ucp;
+} cor;
 
-  void *stack;
+static cor *cor_create(void (*f)(void *), void *arg);
+static void cor_destroy(cor *r);
+static void cor_start();
+static void cor_resume(cor *r);
 
-  jmp_buf jmpbuf;
+/* The currently executing coroutine. */
+static cor * volatile s_curr = NULL;
 
-  int started;
-} coroutine;
+static coid s_next_id = 1;
 
-static coroutine *coroutine_create(void (*f)(void *), void *arg);
-static void coroutine_destroy(coroutine *r);
-static void coroutine_start(coroutine *r);
-static void coroutine_resume(coroutine *r);
-static inline int coroutine_is_started(coroutine *r) {
-  return r->started;
-}
-
-#define CURRENT_COROUTINE g_current_coroutine
-static coroutine *g_current_coroutine = NULL;
-
-static size_t g_next_id = 1;
+#define STACK_SIZE (64 * 1024)
 
 /******************************************************************************
  *****************************************************************************/
@@ -38,7 +34,7 @@ typedef struct conode_s {
   struct conode_s *next;
   struct conode_s *prev;
 
-  coroutine *r;
+  cor *r;
 } conode;
 
 static inline void conode_remove(conode *n) {
@@ -60,22 +56,20 @@ typedef struct costate_s {
 static void costate_create();
 static void costate_destroy();
 
-static costate *g_state = NULL;
+static costate *s_state = NULL;
 
 /******************************************************************************
  *****************************************************************************/
 
 int co_main(int (*f)(int, char **), int argc, char **argv) {
-  if (g_state) {
+  if (s_state) {
     return -1;
   }
 
   costate_create();
 
-  fprintf(stderr, "Creating main coroutine\n");
-  coroutine *r = coroutine_create(NULL, NULL);
-  r->started = 1;
-  CURRENT_COROUTINE = r;
+  cor *r = cor_create(NULL, NULL);
+  s_curr = r;
 
   int result = f(argc, argv);
 
@@ -84,24 +78,29 @@ int co_main(int (*f)(int, char **), int argc, char **argv) {
 }
 
 void co(void (*f)(void *), void *arg) {
-  coroutine_create(f, arg);
+  cor *r = cor_create(f, arg);
+  getcontext(&r->ucp); //TODO: Handle failure
+  r->ucp.uc_stack.ss_sp = calloc(1, STACK_SIZE);
+  r->ucp.uc_stack.ss_size = STACK_SIZE;
+  r->ucp.uc_link = NULL;
+  makecontext(&r->ucp, &cor_start, 0);
 }
 
 /**
  * Implements a simple round-robin coroutine scheduler.
  */
 void co_yield() {
-  if (CURRENT_COROUTINE) {
-    fprintf(stderr, "Coroutine %zu yielding\n", CURRENT_COROUTINE->id);
+  if (s_curr) {
+    fprintf(stderr, "Coroutine %zu yielding\n", s_curr->id);
   }
 
-  conode *n = g_state->sentinel->next;
-  coroutine *r = n->r;
-  if (r && r != CURRENT_COROUTINE) {
+  conode *n = s_state->sentinel->next;
+  cor *r = n->r;
+  if (r && r != s_curr) {
     conode_remove(n);
-    conode_insert(g_state->sentinel->prev, n);
+    conode_insert(s_state->sentinel->prev, n);
 
-    coroutine_resume(r);
+    cor_resume(r);
   }
 }
 
@@ -109,8 +108,8 @@ void co_yield() {
  *****************************************************************************/
 
 void costate_create() {
-  g_state = (costate *)calloc(1, sizeof(costate));
-  conode *s = g_state->sentinel = (conode *)calloc(1, sizeof(conode));
+  s_state = (costate *)calloc(1, sizeof(costate));
+  conode *s = s_state->sentinel = (conode *)calloc(1, sizeof(conode));
   s->next = s;
   s->prev = s;
 }
@@ -118,64 +117,51 @@ void costate_create() {
 void costate_destroy() {
 }
 
-#define STACK_SIZE (2 * 1024 * 1024)
-#define SET_STACK(sp)
-
-coroutine *coroutine_create(void (*f)(void *), void *arg) {
-  coroutine *r = (coroutine *)calloc(1, sizeof(coroutine));
-  r->id = g_next_id++;
+cor *cor_create(void (*f)(void *), void *arg) {
+  cor *r = (cor *)calloc(1, sizeof(cor));
+  r->id = s_next_id++;
   r->f = f;
   r->arg = arg;
 
   conode *n = (conode *)calloc(1, sizeof(conode));
   n->r = r;
-  conode_insert(g_state->sentinel, n);
-
-  fprintf(stderr, "Created coroutine %zu\n", r->id);
+  conode_insert(s_state->sentinel, n);
 
   return r;
 }
 
-void coroutine_destroy(coroutine *r) {
+void cor_destroy(cor *r) {
   fprintf(stderr, "Destroying coroutine %zu\n", r->id);
 
-  conode *n = g_state->sentinel->next;
+  conode *n = s_state->sentinel->next;
   while (n->r != r) {
     n = n->next;
   }
   conode_remove(n);
 
-  free(r->stack);
+  // TODO: Add stack to pool.
   free(r);
   free(n);
 
-  CURRENT_COROUTINE = NULL;
+  s_curr = NULL;
+}
+
+void cor_start() {
+  cor *r = s_curr;
+  r->f(r->arg);
+  cor_destroy(r);
   co_yield();
 }
 
-void coroutine_start(coroutine *r) {
-  r->stack = calloc(1, STACK_SIZE);
-  r->started = 1;
+void cor_resume(cor *r) {
+  fprintf(stderr, "Switching to coroutine %zu\n", r->id);
 
-  SET_STACK(r->stack + STACK_SIZE);
-  CURRENT_COROUTINE = r;
-
-  r->f(r->arg);
-  coroutine_destroy(r);
-}
-
-void coroutine_resume(coroutine *r) {
-  coroutine *yr = CURRENT_COROUTINE;
-  if (yr && setjmp(yr->jmpbuf)) {
-    CURRENT_COROUTINE = yr;
-    return;
-  }
-
-  if (coroutine_is_started(r)) {
-    fprintf(stderr, "Switching to coroutine %zu\n", r->id);
-    longjmp(r->jmpbuf, 1);
+  cor *prev_r = s_curr;
+  s_curr = r;
+  if (!prev_r) {
+    setcontext(&r->ucp);
   } else {
-    fprintf(stderr, "Starting coroutine %zu\n", r->id);
-    coroutine_start(r);
+    swapcontext(&prev_r->ucp, &r->ucp);
+    s_curr = prev_r;
   }
 }
